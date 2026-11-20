@@ -1,0 +1,401 @@
+-- =====================================================================
+-- HOTEL ROOM BOOKING  |  MySQL 8.0  |  Grand Horizon Hotel
+-- Source data: hotel_guest_register_30_guests__1_.csv (30 guests, 30 rooms, 5 room types)
+-- Generic step names mapped to this project:
+--   categories -> room_types | books -> rooms | customers -> guests
+--   orders -> bookings       | order items -> payments
+-- Payments, emails and phones are not in the CSV, so payments below are SAMPLE advance payments.
+-- =====================================================================
+
+-- STEP 1: Create the database and tables
+DROP DATABASE IF EXISTS hotel_db;
+CREATE DATABASE hotel_db CHARACTER SET utf8mb4;
+USE hotel_db;
+
+CREATE TABLE room_types (
+  type_id         INT AUTO_INCREMENT PRIMARY KEY,
+  type_name       VARCHAR(30) NOT NULL UNIQUE,
+  price_per_night DECIMAL(10,2) NOT NULL CHECK (price_per_night > 0)
+);
+CREATE TABLE rooms (
+  room_id  INT AUTO_INCREMENT PRIMARY KEY,
+  room_no  VARCHAR(10) NOT NULL UNIQUE,
+  floor_no INT NOT NULL,
+  type_id  INT NOT NULL,
+  status   ENUM('Available','Booked','Maintenance') NOT NULL DEFAULT 'Available',
+  FOREIGN KEY (type_id) REFERENCES room_types(type_id)
+);
+CREATE TABLE guests (
+  guest_id   INT AUTO_INCREMENT PRIMARY KEY,
+  guest_code VARCHAR(10) NOT NULL UNIQUE,          -- G001 ... from the CSV
+  full_name  VARCHAR(100) NOT NULL,
+  email      VARCHAR(120) UNIQUE,
+  phone      VARCHAR(15)
+);
+CREATE TABLE bookings (
+  booking_id   INT AUTO_INCREMENT PRIMARY KEY,
+  guest_id     INT NOT NULL,
+  room_id      INT NOT NULL,
+  check_in     DATE NOT NULL,
+  check_out    DATE NOT NULL,
+  adults       INT NOT NULL DEFAULT 1,
+  children     INT NOT NULL DEFAULT 0,
+  total_amount DECIMAL(10,2) NOT NULL DEFAULT 0,    -- filled by trigger
+  status       ENUM('PENDING','CONFIRMED','CHECKED_IN','COMPLETED','CANCELLED') NOT NULL DEFAULT 'CONFIRMED',
+  created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  CHECK (check_out > check_in),
+  FOREIGN KEY (guest_id) REFERENCES guests(guest_id),
+  FOREIGN KEY (room_id)  REFERENCES rooms(room_id)
+);
+CREATE TABLE payments (
+  payment_id INT AUTO_INCREMENT PRIMARY KEY,
+  booking_id INT NOT NULL,
+  amount     DECIMAL(10,2) NOT NULL CHECK (amount > 0),
+  method     ENUM('UPI','CARD','CASH','NETBANKING') NOT NULL,
+  paid_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (booking_id) REFERENCES bookings(booking_id)
+);
+CREATE TABLE audit_log (                            -- written by triggers (Step 13)
+  log_id INT AUTO_INCREMENT PRIMARY KEY,
+  table_name VARCHAR(30), action VARCHAR(30), ref_id INT, note VARCHAR(200),
+  logged_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE stg_register (                         -- staging table for the CSV import (Step 15)
+  Hotel_Name VARCHAR(80), Guest_ID VARCHAR(10), Guest_Name VARCHAR(100), Room_Number VARCHAR(10),
+  Room_Type VARCHAR(30), Check_In DATE, Check_Out DATE, Adults INT, Children INT,
+  Booking_Status VARCHAR(20), Nightly_Rate_INR DECIMAL(10,2)
+);
+
+-- STEP 2: Indexes for faster searching
+CREATE INDEX idx_rooms_status     ON rooms(status);
+CREATE INDEX idx_bookings_room_dt ON bookings(room_id, check_in, check_out);   -- overlap check
+CREATE INDEX idx_bookings_guest   ON bookings(guest_id);
+CREATE INDEX idx_bookings_status  ON bookings(status);
+CREATE INDEX idx_payments_booking ON payments(booking_id);
+
+-- STEP 3: Master data (taken from the CSV: room types, rooms, guests)
+INSERT INTO room_types (type_name, price_per_night) VALUES
+('Standard',3500),
+('Deluxe',5200),
+('Executive',7200),
+('Suite',11000),
+('Family',8500);
+
+INSERT INTO rooms (room_no, floor_no, type_id) VALUES
+('101',1,1),
+('102',1,1),
+('103',1,1),
+('104',1,1),
+('105',1,1),
+('106',1,1),
+('107',1,1),
+('108',1,1),
+('109',1,2),
+('110',1,2),
+('111',1,2),
+('112',1,2),
+('113',1,2),
+('114',1,2),
+('115',1,2),
+('201',2,3),
+('202',2,3),
+('203',2,3),
+('204',2,3),
+('205',2,3),
+('206',2,3),
+('301',3,4),
+('302',3,4),
+('303',3,4),
+('304',3,4),
+('305',3,4),
+('401',4,5),
+('402',4,5),
+('403',4,5),
+('404',4,5);
+
+INSERT INTO guests (guest_code, full_name) VALUES
+('G001','Aarav Sharma'),
+('G002','Priya Verma'),
+('G003','Rohan Mehta'),
+('G004','Ananya Das'),
+('G005','Kabir Singh'),
+('G006','Ishita Roy'),
+('G007','Vikram Patel'),
+('G008','Meera Nair'),
+('G009','Arjun Kapoor'),
+('G010','Sana Khan'),
+('G011','Dev Malhotra'),
+('G012','Kavya Iyer'),
+('G013','Aditya Bose'),
+('G014','Neha Chatterjee'),
+('G015','Rahul Joshi'),
+('G016','Tara Mukherjee'),
+('G017','Siddharth Rao'),
+('G018','Diya Sen'),
+('G019','Karan Gupta'),
+('G020','Aisha Fernandes'),
+('G021','Manav Reddy'),
+('G022','Pooja Sinha'),
+('G023','Neil Dutta'),
+('G024','Riya Bhatia'),
+('G025','Sameer Ali'),
+('G026','Mira Thomas'),
+('G027','Yash Kulkarni'),
+('G028','Nandini Ghosh'),
+('G029','Om Prakash'),
+('G030','Zoya Ahmed');
+
+-- STEP 4: Triggers (business rules inside the database)
+DELIMITER $$
+
+-- BEFORE INSERT: block overlapping dates and calculate the total amount
+CREATE TRIGGER trg_bookings_bi BEFORE INSERT ON bookings
+FOR EACH ROW
+BEGIN
+  DECLARE v_price DECIMAL(10,2);
+  IF NEW.status IN ('PENDING','CONFIRMED','CHECKED_IN') AND EXISTS (
+       SELECT 1 FROM bookings
+       WHERE room_id = NEW.room_id AND status IN ('PENDING','CONFIRMED','CHECKED_IN')
+         AND NEW.check_in < check_out AND NEW.check_out > check_in) THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Room is already booked for these dates';
+  END IF;
+  SELECT t.price_per_night INTO v_price
+    FROM rooms r JOIN room_types t ON t.type_id = r.type_id WHERE r.room_id = NEW.room_id;
+  SET NEW.total_amount = v_price * DATEDIFF(NEW.check_out, NEW.check_in);
+END$$
+
+-- AFTER INSERT: mark the room as Booked and log it
+CREATE TRIGGER trg_bookings_ai AFTER INSERT ON bookings
+FOR EACH ROW
+BEGIN
+  IF NEW.status IN ('PENDING','CONFIRMED','CHECKED_IN') THEN
+    UPDATE rooms SET status = 'Booked' WHERE room_id = NEW.room_id;
+  END IF;
+  INSERT INTO audit_log (table_name, action, ref_id, note)
+  VALUES ('bookings','INSERT',NEW.booking_id,CONCAT('Room ',NEW.room_id,' booked, total ',NEW.total_amount));
+END$$
+
+-- Challenge 1: AFTER UPDATE - release the room when a booking is CANCELLED or COMPLETED
+CREATE TRIGGER trg_bookings_au AFTER UPDATE ON bookings
+FOR EACH ROW
+BEGIN
+  IF NEW.status IN ('CANCELLED','COMPLETED') AND OLD.status NOT IN ('CANCELLED','COMPLETED') THEN
+    UPDATE rooms SET status = 'Available' WHERE room_id = NEW.room_id;
+    INSERT INTO audit_log (table_name, action, ref_id, note)
+    VALUES ('bookings',NEW.status,NEW.booking_id,CONCAT('Room ',NEW.room_id,' released'));
+  END IF;
+END$$
+
+-- Payments: do not accept more than the booking total, and log every payment
+CREATE TRIGGER trg_payments_bi BEFORE INSERT ON payments
+FOR EACH ROW
+BEGIN
+  IF (SELECT IFNULL(SUM(amount),0) FROM payments WHERE booking_id = NEW.booking_id) + NEW.amount >
+     (SELECT total_amount FROM bookings WHERE booking_id = NEW.booking_id) THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = 'Payment is more than the booking total';
+  END IF;
+END$$
+CREATE TRIGGER trg_payments_ai AFTER INSERT ON payments
+FOR EACH ROW
+BEGIN
+  INSERT INTO audit_log (table_name, action, ref_id, note)
+  VALUES ('payments','INSERT',NEW.booking_id,CONCAT('Paid ',NEW.amount,' by ',NEW.method));
+END$$
+DELIMITER ;
+
+-- STEP 5: Transaction data (bookings, then advance payments)
+-- STEP 5a: Bookings from the CSV (row n = guest n = room n). Triggers check overlaps and calculate totals.
+INSERT INTO bookings (guest_id, room_id, check_in, check_out, adults, children, status) VALUES
+(1,1,'2026-11-16','2026-11-19',2,0,'CHECKED_IN'),
+(2,2,'2026-11-16','2026-11-18',1,0,'CONFIRMED'),
+(3,3,'2026-11-17','2026-11-20',2,1,'CONFIRMED'),
+(4,4,'2026-11-18','2026-11-21',1,0,'CONFIRMED'),
+(5,5,'2026-11-19','2026-11-22',2,0,'CONFIRMED'),
+(6,6,'2026-11-20','2026-11-23',2,0,'PENDING'),
+(7,7,'2026-11-21','2026-11-24',1,1,'CONFIRMED'),
+(8,8,'2026-11-22','2026-11-25',2,0,'CONFIRMED'),
+(9,9,'2026-11-16','2026-11-20',2,0,'CHECKED_IN'),
+(10,10,'2026-11-16','2026-11-19',2,1,'CONFIRMED'),
+(11,11,'2026-11-17','2026-11-21',1,0,'CONFIRMED'),
+(12,12,'2026-11-18','2026-11-22',2,0,'CONFIRMED'),
+(13,13,'2026-11-19','2026-11-23',2,0,'PENDING'),
+(14,14,'2026-11-20','2026-11-24',1,0,'CONFIRMED'),
+(15,15,'2026-11-21','2026-11-25',2,2,'CONFIRMED'),
+(16,16,'2026-11-16','2026-11-19',1,0,'CHECKED_IN'),
+(17,17,'2026-11-17','2026-11-21',2,0,'CONFIRMED'),
+(18,18,'2026-11-18','2026-11-22',2,1,'CONFIRMED'),
+(19,19,'2026-11-19','2026-11-23',1,0,'CONFIRMED'),
+(20,20,'2026-11-20','2026-11-24',2,0,'PENDING'),
+(21,21,'2026-11-21','2026-11-25',2,0,'CONFIRMED'),
+(22,22,'2026-11-16','2026-11-20',2,0,'CHECKED_IN'),
+(23,23,'2026-11-17','2026-11-21',2,1,'CONFIRMED'),
+(24,24,'2026-11-18','2026-11-22',2,0,'CONFIRMED'),
+(25,25,'2026-11-19','2026-11-24',3,0,'CONFIRMED'),
+(26,26,'2026-11-20','2026-11-25',2,0,'PENDING'),
+(27,27,'2026-11-16','2026-11-21',2,2,'CHECKED_IN'),
+(28,28,'2026-11-17','2026-11-22',2,2,'CONFIRMED'),
+(29,29,'2026-11-19','2026-11-24',2,1,'CONFIRMED'),
+(30,30,'2026-11-21','2026-11-26',2,2,'CONFIRMED');
+-- STEP 5b: Extra sample bookings so the "repeat guests" report has data
+INSERT INTO bookings (guest_id, room_id, check_in, check_out, adults, children, status) VALUES
+(1, 1,  '2026-12-01','2026-12-03', 2, 0, 'CONFIRMED'),   -- Aarav Sharma again
+(1, 10, '2026-12-10','2026-12-12', 2, 0, 'CONFIRMED'),   -- Aarav Sharma, third stay
+(2, 6,  '2026-12-05','2026-12-07', 1, 0, 'CONFIRMED');   -- Priya Verma again
+
+-- STEP 5c: Sample advance payments: checked-in guests pay in full, confirmed guests 30%, pending pay nothing
+INSERT INTO payments (booking_id, amount, method)
+SELECT booking_id, total_amount, 'UPI'  FROM bookings WHERE status = 'CHECKED_IN';
+INSERT INTO payments (booking_id, amount, method)
+SELECT booking_id, ROUND(total_amount * 0.30, 2), 'CARD' FROM bookings WHERE status = 'CONFIRMED';
+
+-- STEP 6: SELECT basics
+SELECT * FROM rooms WHERE status = 'Available';                          -- WHERE
+SELECT DISTINCT type_name FROM room_types;                               -- DISTINCT
+SELECT * FROM guests WHERE full_name LIKE 'A%';                          -- LIKE
+SELECT * FROM bookings WHERE check_in BETWEEN '2026-11-16' AND '2026-11-18';   -- BETWEEN
+SELECT b.booking_id, g.full_name, r.room_no, t.type_name, b.check_in, b.check_out, b.total_amount, b.status
+FROM bookings b
+JOIN guests g     ON g.guest_id = b.guest_id
+JOIN rooms r      ON r.room_id  = b.room_id
+JOIN room_types t ON t.type_id  = r.type_id;                             -- JOIN
+
+-- STEP 7: ORDER BY and LIMIT
+SELECT booking_id, total_amount FROM bookings ORDER BY total_amount DESC LIMIT 3;
+SELECT full_name, guest_code FROM guests ORDER BY full_name LIMIT 5;
+
+-- STEP 8: GROUP BY, HAVING and reports
+SELECT DATE_FORMAT(check_in,'%Y-%m') AS month, COUNT(*) AS bookings,
+       SUM(DATEDIFF(check_out,check_in)) AS room_nights
+FROM bookings WHERE status <> 'CANCELLED' GROUP BY month ORDER BY month;     -- occupancy per month
+SELECT t.type_name, SUM(b.total_amount) AS revenue
+FROM bookings b JOIN rooms r ON r.room_id=b.room_id JOIN room_types t ON t.type_id=r.type_id
+WHERE b.status <> 'CANCELLED' GROUP BY t.type_name ORDER BY revenue DESC;    -- revenue per room type
+SELECT g.full_name, COUNT(*) AS stays
+FROM bookings b JOIN guests g ON g.guest_id=b.guest_id
+GROUP BY g.guest_id, g.full_name HAVING COUNT(*) > 1;                        -- repeat guests
+SELECT status, COUNT(*) AS bookings FROM bookings GROUP BY status;
+
+-- STEP 9: UPDATE
+UPDATE room_types SET price_per_night = price_per_night * 1.05 WHERE type_name = 'Suite';
+UPDATE guests SET phone = '9800000000', email = 'aarav.sharma@example.com' WHERE guest_code = 'G001';
+UPDATE bookings SET status = 'CONFIRMED' WHERE booking_id = 6;     -- Ishita Roy: pending -> confirmed
+UPDATE bookings SET status = 'CANCELLED' WHERE booking_id = 26;    -- Mira Thomas cancels: fires trg_bookings_au
+
+-- STEP 10: DELETE (children first because of foreign keys)
+INSERT INTO guests (guest_code, full_name) VALUES ('G999','Test Guest');
+DELETE FROM guests WHERE guest_code = 'G999';
+DELETE FROM payments WHERE booking_id IN (SELECT booking_id FROM bookings WHERE status = 'CANCELLED');
+
+-- STEP 11: Views
+CREATE OR REPLACE VIEW v_available_rooms AS            -- currently available rooms
+SELECT r.room_id, r.room_no, t.type_name, t.price_per_night
+FROM rooms r JOIN room_types t ON t.type_id = r.type_id
+WHERE r.status <> 'Maintenance'
+  AND NOT EXISTS (SELECT 1 FROM bookings b WHERE b.room_id = r.room_id
+                  AND b.status IN ('PENDING','CONFIRMED','CHECKED_IN')
+                  AND CURDATE() >= b.check_in AND CURDATE() < b.check_out);
+
+CREATE OR REPLACE VIEW v_booking_summary AS
+SELECT b.booking_id, g.guest_code, g.full_name, r.room_no, t.type_name,
+       b.check_in, b.check_out, b.adults, b.children, b.total_amount, b.status,
+       IFNULL(SUM(p.amount),0) AS paid
+FROM bookings b JOIN guests g ON g.guest_id=b.guest_id
+JOIN rooms r ON r.room_id=b.room_id JOIN room_types t ON t.type_id=r.type_id
+LEFT JOIN payments p ON p.booking_id=b.booking_id
+GROUP BY b.booking_id, g.guest_code, g.full_name, r.room_no, t.type_name,
+         b.check_in, b.check_out, b.adults, b.children, b.total_amount, b.status;
+
+-- Challenge 2: bookings that still owe money
+CREATE OR REPLACE VIEW v_unpaid_bookings AS
+SELECT booking_id, full_name, room_no, total_amount, paid, total_amount - paid AS balance
+FROM v_booking_summary
+WHERE status IN ('PENDING','CONFIRMED','CHECKED_IN') AND paid < total_amount;
+
+SELECT * FROM v_available_rooms;
+SELECT * FROM v_unpaid_bookings;
+
+-- STEP 12: Transactions (COMMIT, ROLLBACK, SAVEPOINT)
+-- 12a. Create a booking and take the advance payment together
+START TRANSACTION;
+INSERT INTO bookings (guest_id, room_id, check_in, check_out, adults, children)
+VALUES (7, 29, '2026-12-20','2026-12-23', 2, 1);
+SET @bid = LAST_INSERT_ID();
+INSERT INTO payments (booking_id, amount, method)
+SELECT @bid, total_amount * 0.5, 'UPI' FROM bookings WHERE booking_id = @bid;
+COMMIT;
+
+-- 12b. SAVEPOINT + ROLLBACK
+START TRANSACTION;
+INSERT INTO bookings (guest_id, room_id, check_in, check_out) VALUES (8, 30, '2026-12-28','2026-12-30');
+SAVEPOINT after_first;
+INSERT INTO bookings (guest_id, room_id, check_in, check_out) VALUES (8, 28, '2026-12-28','2026-12-30');
+ROLLBACK TO SAVEPOINT after_first;     -- undo only the second booking
+COMMIT;                                -- keeps the first
+
+-- 12c. Challenge 3: two rooms in one transaction, the second FAILS -> everything is rolled back.
+-- Room 101 (room_id 1) is taken 16-19 Nov, so the trigger blocks the second insert (ERROR 1644).
+-- Run line by line in the MySQL client; after the error, run ROLLBACK.
+START TRANSACTION;
+INSERT INTO bookings (guest_id, room_id, check_in, check_out) VALUES (9, 20, '2027-01-05','2027-01-07');
+INSERT INTO bookings (guest_id, room_id, check_in, check_out) VALUES (9, 1,  '2026-11-17','2026-11-18');
+ROLLBACK;
+SELECT COUNT(*) AS should_be_zero FROM bookings WHERE guest_id = 9 AND check_in >= '2027-01-01';
+
+-- Same test as a procedure (rolls back automatically on any error)
+DELIMITER $$
+CREATE PROCEDURE sp_book_two_rooms(IN g INT, IN r1 INT, IN r2 INT, IN d1 DATE, IN d2 DATE)
+BEGIN
+  DECLARE EXIT HANDLER FOR SQLEXCEPTION BEGIN ROLLBACK; SELECT 'Rolled back' AS result; END;
+  START TRANSACTION;
+  INSERT INTO bookings (guest_id, room_id, check_in, check_out) VALUES (g, r1, d1, d2);
+  INSERT INTO bookings (guest_id, room_id, check_in, check_out) VALUES (g, r2, d1, d2);
+  COMMIT; SELECT 'Committed' AS result;
+END$$
+DELIMITER ;
+-- CALL sp_book_two_rooms(9, 20, 1, '2026-11-17', '2026-11-18');    -- fails and rolls back
+
+-- STEP 13: Check what the triggers recorded
+SELECT * FROM audit_log ORDER BY log_id DESC LIMIT 20;
+SELECT room_no, status FROM rooms WHERE status = 'Booked';
+
+-- Challenge 4: most valuable guest for each room type (the CSV has no city column)
+SELECT type_name, full_name, spent FROM (
+  SELECT t.type_name, g.full_name, SUM(b.total_amount) AS spent,
+         RANK() OVER (PARTITION BY t.type_name ORDER BY SUM(b.total_amount) DESC) AS rnk
+  FROM bookings b JOIN guests g ON g.guest_id=b.guest_id
+  JOIN rooms r ON r.room_id=b.room_id JOIN room_types t ON t.type_id=r.type_id
+  WHERE b.status <> 'CANCELLED' GROUP BY t.type_name, g.guest_id, g.full_name) x
+WHERE rnk = 1;
+
+-- Challenge 5: index before / after with EXPLAIN (compare type, key and rows)
+EXPLAIN SELECT * FROM guests WHERE full_name = 'Aarav Sharma';   -- type=ALL (full scan)
+CREATE INDEX idx_guests_name ON guests(full_name);
+EXPLAIN SELECT * FROM guests WHERE full_name = 'Aarav Sharma';   -- type=ref, key=idx_guests_name
+
+-- STEP 14: Export data to CSV (folder must match: SHOW VARIABLES LIKE 'secure_file_priv';)
+SELECT 'booking_id','guest_code','full_name','room_no','type_name','check_in','check_out','total_amount','paid','status'
+UNION ALL
+SELECT booking_id, guest_code, full_name, room_no, type_name, check_in, check_out, total_amount, paid, status
+FROM v_booking_summary
+INTO OUTFILE '/var/lib/mysql-files/booking_list.csv'
+FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"' LINES TERMINATED BY '\n';
+-- Challenge 6: v_order_summary in the template = v_booking_summary here. Export it as above, open in Excel.
+
+-- STEP 15: Import data from CSV
+-- Copy hotel_guest_register_30_guests__1_.csv into the secure_file_priv folder first.
+TRUNCATE stg_register;
+LOAD DATA INFILE '/var/lib/mysql-files/hotel_guest_register_30_guests__1_.csv'
+INTO TABLE stg_register
+FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"' LINES TERMINATED BY '\r\n'   -- use '\n' if the file has Unix line endings
+IGNORE 1 LINES;
+-- add only guests that are not already in the guests table (re-running adds 0 rows)
+INSERT INTO guests (guest_code, full_name)
+SELECT s.Guest_ID, s.Guest_Name FROM stg_register s
+WHERE NOT EXISTS (SELECT 1 FROM guests g WHERE g.guest_code = s.Guest_ID);
+SELECT COUNT(*) AS rows_in_staging FROM stg_register;
+SELECT COUNT(*) AS total_guests    FROM guests;
+
+-- 5.4 Backup and restore (run in the OS terminal, not in MySQL)
+--   mysqldump -u root -p --routines --triggers hotel_db > hotel_backup.sql
+--   mysql -u root -p -e "DROP DATABASE hotel_db; CREATE DATABASE hotel_db;"
+--   mysql -u root -p hotel_db < hotel_backup.sql
